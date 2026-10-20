@@ -7,7 +7,7 @@ on:
         description: Explicitly arm this mock-only run
         type: boolean
         default: false
-      off:
+      'off':
         description: Disable all mock actions immediately
         type: boolean
         default: false
