@@ -1,0 +1,247 @@
+# Generic mock proof only: no provider client, credentials or real resources.
+name: Hosted mock cleanup proof
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: Explicitly arm this mock-only run
+        type: boolean
+        default: false
+      off:
+        description: Disable all mock actions immediately
+        type: boolean
+        default: false
+      due_utc:
+        description: Mock due time as ISO8601 UTC ending in Z
+        type: string
+        default: ''
+      expires_utc:
+        description: End of finite mock window (maximum 30 minutes after due)
+        type: string
+        default: ''
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+permissions: {}
+concurrency:
+  group: hosted-mock-cleanup-proof
+  cancel-in-progress: false
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      MOCK_TRIGGER: ${{ github.event_name }}
+      MOCK_DISPATCH_ARM: ${{ inputs.arm }}
+      MOCK_DISPATCH_OFF: ${{ inputs.off }}
+      MOCK_DISPATCH_DUE_UTC: ${{ inputs.due_utc }}
+      MOCK_DISPATCH_EXPIRES_UTC: ${{ inputs.expires_utc }}
+      MOCK_SCHEDULE_ARM: ${{ vars.MOCK_ARM }}
+      MOCK_SCHEDULE_OFF: ${{ vars.MOCK_OFF }}
+      MOCK_SCHEDULE_DUE_UTC: ${{ vars.MOCK_DUE_UTC }}
+      MOCK_SCHEDULE_EXPIRES_UTC: ${{ vars.MOCK_EXPIRES_UTC }}
+    steps:
+      - name: Run isolated in-memory ownership and scheduling proof
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY'
+          """Generic, secret-free hosted scheduler proof. No real provider integration.
+
+          All resources and identifiers below are in-memory mock values.
+          """
+          from __future__ import annotations
+
+          from copy import deepcopy
+          from datetime import datetime, timedelta, timezone
+          import json
+          import os
+
+          SCOPE = {"project": "mock-project-alpha", "lab": "mock-lab-one"}
+          LEDGER = (
+              {"id": "mock-worker-01", "kind": "worker", **SCOPE},
+              {"id": "mock-source-01", "kind": "source", **SCOPE},
+          )
+          FOREIGN = {"id": "mock-unrelated-01", "kind": "worker",
+                     "project": "mock-project-other", "lab": "mock-lab-other"}
+          MAX_WINDOW = timedelta(minutes=30)
+
+
+          class Rejected(ValueError):
+              """Only fixed public reason codes; no input values."""
+
+
+          def require(condition, code):
+              if not condition:
+                  raise Rejected(code)
+
+
+          def boolean(value):
+              require(value in ("", "false", "true"), "invalid_boolean")
+              return value == "true"
+
+
+          def timestamp(value):
+              require(isinstance(value, str) and value.endswith("Z"), "UTC_timestamp_required")
+              try:
+                  parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+              except (ValueError, OverflowError):
+                  raise Rejected("invalid_timestamp") from None
+              require(parsed.utcoffset() == timedelta(0), "UTC_timestamp_required")
+              return parsed
+
+
+          def iso(value):
+              return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+          def gate(*, armed, off, due, expires, now):
+              require(type(armed) is bool and type(off) is bool, "invalid_boolean")
+              require(isinstance(now, datetime) and now.utcoffset() == timedelta(0),
+                      "UTC_clock_required")
+              if off:
+                  return "OFF"
+              if not armed:
+                  return "DISARMED"
+              due_at, end_at = timestamp(due), timestamp(expires)
+              require(timedelta(0) < end_at - due_at <= MAX_WINDOW, "finite_window_required")
+              if now >= end_at:
+                  return "EXPIRED"
+              require(due_at - now <= timedelta(hours=24), "due_too_far_in_future")
+              return "DUE" if now >= due_at else "WAITING"
+
+
+          class MemoryProvider:
+              """Not an HTTP client. Never reads credentials, sockets, files or processes."""
+
+              def __init__(self):
+                  self.rows = {row["id"]: deepcopy(row) for row in (*LEDGER, FOREIGN)}
+                  self.deleted = []
+
+              def inspect(self, identity):
+                  return deepcopy(self.rows.get(identity))
+
+              def delete(self, identity):
+                  require(identity in self.rows, "mock_resource_missing")
+                  del self.rows[identity]
+                  self.deleted.append(identity)
+
+
+          def cleanup(provider, ledger=LEDGER):
+              require(isinstance(ledger, (tuple, list)) and len(ledger) == len(LEDGER),
+                      "exact_ledger_required")
+              require(list(ledger) == list(LEDGER), "exact_ledger_required")
+              # Validate the complete pinned ledger before the first mutation.
+              for item in ledger:
+                  row = provider.inspect(item["id"])
+                  require(row is None or row == item, "mock_scope_or_identity_mismatch")
+              outcomes = []
+              for item in ledger:
+                  # Fresh ownership check at the mutation boundary.
+                  row = provider.inspect(item["id"])
+                  if row is None:
+                      outcomes.append("ALREADY_ABSENT")
+                      continue
+                  require(row == item, "mock_scope_or_identity_mismatch")
+                  provider.delete(item["id"])
+                  require(provider.inspect(item["id"]) is None, "mock_absence_not_confirmed")
+                  outcomes.append("DELETED")
+              return outcomes
+
+
+          def proof(now):
+              provider = MemoryProvider()
+              preserved = provider.inspect(FOREIGN["id"])
+              first = cleanup(provider)
+              second = cleanup(provider)
+              require(first == ["DELETED", "DELETED"], "due_cleanup_failed")
+              require(second == ["ALREADY_ABSENT", "ALREADY_ABSENT"], "idempotency_failed")
+              require(provider.deleted == [item["id"] for item in LEDGER],
+                      "unexpected_mock_mutation")
+              require(provider.inspect(FOREIGN["id"]) == preserved, "unrelated_changed")
+
+              # A forged owner under a pinned ID must fail before any delete.
+              wrong_scope = MemoryProvider()
+              wrong_scope.rows[LEDGER[1]["id"]]["project"] = FOREIGN["project"]
+              denied = False
+              try:
+                  cleanup(wrong_scope)
+              except Rejected as error:
+                  require(str(error) == "mock_scope_or_identity_mismatch",
+                          "unexpected_denial_reason")
+                  denied = True
+              require(denied and not wrong_scope.deleted, "cross_scope_not_denied")
+
+              # No dynamically discovered resource can be substituted into the ledger.
+              substituted = [deepcopy(LEDGER[0]), deepcopy(FOREIGN)]
+              try:
+                  cleanup(MemoryProvider(), substituted)
+              except Rejected as error:
+                  require(str(error) == "exact_ledger_required", "unexpected_ledger_reason")
+              else:
+                  raise Rejected("unapproved_ledger_accepted")
+
+              due, end = iso(now - timedelta(minutes=1)), iso(now + timedelta(minutes=1))
+              require(gate(armed=True, off=False, due=due, expires=end, now=now) == "DUE",
+                      "due_gate_failed")
+              require(gate(armed=False, off=False, due="", expires="", now=now) == "DISARMED",
+                      "default_not_disarmed")
+              require(gate(armed=True, off=True, due=due, expires=end, now=now) == "OFF",
+                      "off_switch_failed")
+              require(gate(armed=True, off=False, due=due, expires=end,
+                           now=now + timedelta(minutes=2)) == "EXPIRED", "expiry_failed")
+              return {
+                  "due_cleanup": True, "idempotency": True, "exact_ledger": True,
+                  "cross_scope_denial": True, "unrelated_preserved": True,
+                  "default_disarmed": True, "expiry": True, "off_switch": True,
+              }
+
+
+          def selected_config(environment):
+              trigger = environment.get("MOCK_TRIGGER", "local_test")
+              require(trigger in ("schedule", "workflow_dispatch", "local_test"),
+                      "unsupported_trigger")
+              prefix = "MOCK_DISPATCH_" if trigger == "workflow_dispatch" else "MOCK_SCHEDULE_"
+              return {
+                  "trigger": trigger,
+                  "armed": boolean(environment.get(prefix + "ARM", "")),
+                  "off": boolean(environment.get(prefix + "OFF", "")),
+                  "due": environment.get(prefix + "DUE_UTC", ""),
+                  "expires": environment.get(prefix + "EXPIRES_UTC", ""),
+              }
+
+
+          def main(environment=None, clock=None):
+              environment = os.environ if environment is None else environment
+              clock = (lambda: datetime.now(timezone.utc)) if clock is None else clock
+              started = clock()
+              report = {
+                  "status": "NOT_RUN", "real_provider_calls": 0,
+                  "credentials_used": False, "real_cloud_deletion_tested": False,
+                  "provider_permissions_tested": False, "strict_deadline_guaranteed": False,
+                  "started_at_utc": iso(started),
+              }
+              code = 0
+              try:
+                  config = selected_config(environment)
+                  report["trigger"] = config.pop("trigger")
+                  state = gate(**config, now=started)
+                  report["gate"] = state
+                  if state == "DUE":
+                      report["checks"] = proof(started)
+                      report["status"] = "PASS_HOSTED_MOCK_ONLY"
+                  else:
+                      report["status"] = "NO_ACTION_" + state
+              except Rejected as error:
+                  report.update(status="REJECTED", reason=str(error))
+                  code = 2
+              except Exception:
+                  report.update(status="REJECTED", reason="unexpected_mock_error")
+                  code = 2
+              report["finished_at_utc"] = iso(clock())
+              print(json.dumps(report, sort_keys=True, allow_nan=False))
+              return code
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+
+          PY
