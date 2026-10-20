@@ -1,0 +1,49 @@
+name: Bounded exact-ledger cleanup
+
+'on':
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: Attempt only an already-approved, explicitly armed private ledger
+        type: boolean
+        required: true
+        default: false
+
+# Checkout needs repository read only. No provider permissions are granted here.
+permissions:
+  contents: read
+
+concurrency:
+  group: exact-ledger-hosted-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'schedule' || inputs.execute == true)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Read reviewed controller source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run default-disarmed private exact-ledger controller
+        shell: bash
+        env:
+          NEXSIGHT_TEARDOWN_CONTROL_JSON: ${{ secrets.NEXSIGHT_TEARDOWN_CONTROL_JSON }}
+          NEXSIGHT_TEARDOWN_LEDGER_JSON: ${{ secrets.NEXSIGHT_TEARDOWN_LEDGER_JSON }}
+          NEXSIGHT_TEARDOWN_EXPECTED_PROJECT: ${{ secrets.NEXSIGHT_TEARDOWN_EXPECTED_PROJECT }}
+          NEXSIGHT_TEARDOWN_SOURCE_BUNDLE: ${{ secrets.NEXSIGHT_TEARDOWN_SOURCE_BUNDLE }}
+          NEXSIGHT_TEARDOWN_ACCESS_KEY: ${{ secrets.NEXSIGHT_TEARDOWN_ACCESS_KEY }}
+          NEXSIGHT_TEARDOWN_SECRET_KEY: ${{ secrets.NEXSIGHT_TEARDOWN_SECRET_KEY }}
+        run: python3 -I -B control-live/hosted_teardown.py --execute
+
+# PREPARATION ONLY: requires explicit deployment/secret-handoff/arming approval.
+# Scheduled Actions are best effort, not a guaranteed deadline or financial cap.
+# No real project, resource ID, address, key or ledger belongs in this file.
