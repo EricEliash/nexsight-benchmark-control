@@ -1,0 +1,86 @@
+name: Cherry benchmark read-only and exact-ledger cleanup
+
+'on':
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: false is read-only; true permits only an explicitly armed private exact ledger
+        type: boolean
+        required: true
+        default: false
+  workflow_run:
+    workflows: ['Cherry finite cleanup wake-up']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cherry-exact-ledger-controller
+  cancel-in-progress: false
+
+jobs:
+  control:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.name == 'Cherry finite cleanup wake-up' &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Read reviewed default-branch controller
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source before exposing the provider credential to a process
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA256: ${{ secrets.NEXSIGHT_CHERRY_SOURCE_SHA256 }}
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, os, pathlib, re
+          expected = os.environ.get('EXPECTED_SOURCE_SHA256', '')
+          actual = hashlib.sha256(pathlib.Path('control-live/cherry_cleanup.py').read_bytes()).hexdigest()
+          if not re.fullmatch(r'[a-f0-9]{64}', expected) or actual != expected:
+              raise SystemExit('SOURCE_PIN_FAIL')
+          print('SOURCE_PIN_PASS')
+          PY
+      - name: Bind automatic cleanup to this approved independent waiter
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          EXPECTED_WAITER_ID: ${{ secrets.NEXSIGHT_CHERRY_EXPECTED_WAITER_RUN_ID }}
+          ACTUAL_WAITER_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_WAITER_ID', '')
+          if not re.fullmatch(r'[1-9][0-9]*', expected) or expected != os.environ.get('ACTUAL_WAITER_ID'):
+              raise SystemExit('WAITER_BINDING_FAIL')
+          print('WAITER_BINDING_PASS')
+          PY
+      - name: Run guarded provider-specific controller
+        shell: bash
+        env:
+          CHERRY_API_TOKEN: ${{ secrets.NEXSIGHT_CHERRY_API_TOKEN }}
+          NEXSIGHT_CHERRY_EXPECTED_TEAM: ${{ secrets.NEXSIGHT_CHERRY_EXPECTED_TEAM }}
+          NEXSIGHT_CHERRY_EXPECTED_PROJECT: ${{ secrets.NEXSIGHT_CHERRY_EXPECTED_PROJECT }}
+          NEXSIGHT_CHERRY_CONTROL_JSON: ${{ secrets.NEXSIGHT_CHERRY_CONTROL_JSON }}
+          NEXSIGHT_CHERRY_LEDGER_JSON: ${{ secrets.NEXSIGHT_CHERRY_LEDGER_JSON }}
+          CHERRY_EXECUTE: ${{ github.event_name == 'workflow_run' || inputs.execute == true }}
+        run: |
+          case "$CHERRY_EXECUTE" in
+            true) python3 -I -B control-live/cherry_cleanup.py --execute ;;
+            false) python3 -I -B control-live/cherry_cleanup.py --probe ;;
+            *) exit 2 ;;
+          esac
+
+# Preparation only. No cron, paid provisioning, credentials or account IDs.
+# A successful read-only probe does not arm future unknown resource IDs.

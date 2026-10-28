@@ -1,0 +1,45 @@
+name: Cherry finite cleanup wake-up
+
+'on':
+  workflow_dispatch:
+    inputs:
+      due_utc:
+        description: Exact UTC cleanup due, at most 210 minutes from runner admission
+        type: string
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cherry-finite-cleanup-wakeup
+  cancel-in-progress: false
+
+jobs:
+  wait:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 215
+    steps:
+      - name: Read unchanged generic finite waiter
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify and run secret-free finite wait
+        shell: bash
+        env:
+          WAKEUP_DUE_UTC: ${{ inputs.due_utc }}
+        run: |
+          python3 -I -B - <<'PY'
+          import hashlib, pathlib, runpy
+          path = pathlib.Path('control-live/finite_wakeup.py')
+          if hashlib.sha256(path.read_bytes()).hexdigest() != 'b258184f8f512f539ece7bf7e29b8b3bee346664d6680de7b7cf7c0d2c2e9d69':
+              raise SystemExit('WAITER_SOURCE_PIN_FAIL')
+          runpy.run_path(str(path), run_name='__main__')
+          PY
+
+# No secrets/provider access here. Only the separately guarded Cherry control
+# workflow handles the success event; no Scaleway workflow is changed or woken.
