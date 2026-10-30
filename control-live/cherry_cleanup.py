@@ -142,7 +142,9 @@ class Api:
             require(status_filter in {"assigned", "available"} and method == "GET"
                     and re.fullmatch(r"/v1/(?:projects/[1-9][0-9]*/ips|servers/[1-9][0-9]*/(?:ips|subnets))", path),
                     "STATUS_FILTER_FORBIDDEN")
-            params["status"] = status_filter
+            # Official cherrygo GetOptions.Encode uses array keys even for a
+            # singleton: status[]=assigned, not the scalar status=assigned.
+            params["status[]"] = status_filter
         url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
         delay = 0.3 - (time.monotonic() - self._last_request)
         if delay > 0:
@@ -310,10 +312,19 @@ def inventory(api, control: dict) -> dict:
     for kind in INVENTORIES:
         path = f"/v1/projects/{control['project_id']}/{kind}"
         if kind == "ips":
-            items = [item for state in ("assigned", "available")
-                     for item in listing(api, path, status_filter=state)]
-            require(len({item.get("id") for item in items}) == len(items), "STATUS_INVENTORY_INCONSISTENT")
-            observed[kind] = items
+            by_id = {}
+            for state in ("assigned", "available"):
+                for item in listing(api, path, status_filter=state):
+                    identity = item.get("id")
+                    if identity in by_id:
+                        # Two sequential filtered requests are not an atomic
+                        # snapshot. Union exact matching records, never hide a
+                        # changed href/metadata or a duplicate within one list.
+                        require(item == by_id[identity], "STATUS_INVENTORY_INCONSISTENT")
+                        href(item.get("href"), f"/v1/ips/{identity}")
+                    else:
+                        by_id[identity] = item
+            observed[kind] = list(by_id.values())
         else:
             observed[kind] = listing(api, path)
     return observed
