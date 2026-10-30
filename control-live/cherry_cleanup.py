@@ -2,9 +2,11 @@
 """Inert-by-default, exact-ledger Cherry Servers cleanup adapter.
 
 Official API contract: https://api.cherryservers.com/doc/ (v1, reviewed 2026-10-29).
-Only GET and exact-ID DELETE for servers, backup-storages and IPs are supported.
+Only GET and exact-ID DELETE for servers, backup-storages and tagged floating IPs
+are supported. Exact enrolled primary/private IPv4 and IPv6/64 server children
+are passively verified and released by parent termination, never DELETEd here.
 No provisioning, key management, team/project deletion, bulk deletion or retries.
-EBS, subnets and load balancers are inventoried but MUST remain absent.
+EBS, custom/unknown subnets and load balancers MUST remain absent.
 
 Inputs are private environment variables, never command arguments or output:
 NEXSIGHT_CHERRY_CONTROL_JSON, NEXSIGHT_CHERRY_LEDGER_JSON, CHERRY_API_TOKEN.
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -33,13 +36,17 @@ from pathlib import Path
 API = "https://api.cherryservers.com"
 REGION = 3  # Chicago, from the reviewed portal quotation; live probe rechecks it.
 PLANS = {"dut": 739, "generator": 747}
-ENDPOINTS = {"server": "servers", "backup_storage": "backup-storages", "ip": "ips"}
+ENDPOINTS = {"server": "servers", "backup_storage": "backup-storages", "ip": "ips",
+             "managed_ip": "ips", "managed_ipv6_subnet": "subnets"}
+MANAGED = {"managed_ip", "managed_ipv6_subnet"}
 INVENTORIES = ("servers", "backup-storages", "ips", "storages", "subnets", "load-balancers")
 SENSITIVE = {"password", "secret", "token", "access_token", "refresh_token", "bmc", "user_data", "userdata", "console"}
 SAFE_FIELDS = {
     "server": "id,href,hostname,project,plan,region,tags,backup_storage,storage",
     "backup_storage": "id,href",
-    "ip": "id,href,project,region,tags",
+    "ip": "id,href,project,region,tags,type",
+    "managed_ip": "id,href,project,region,assigned_to,type,address_family",
+    "managed_ipv6_subnet": "id,href,project,region,assigned_to,address_family,cidr",
 }
 
 
@@ -115,24 +122,33 @@ class Api:
             urllib.request.HTTPSHandler(context=ssl.create_default_context()),
         )
         self._last_request = 0.0
+        self._hard_end = time.monotonic() + 20 * 60
 
-    def request(self, method: str, path: str, fields: str | None = None, offset: int | None = None):
+    def request(self, method: str, path: str, fields: str | None = None, offset: int | None = None,
+                status_filter: str | None = None):
         require(datetime.now(timezone.utc) < self._deadline, "REQUEST_WINDOW_EXPIRED")
+        require(time.monotonic() < self._hard_end, "API_EXECUTION_BUDGET_EXPIRED")
         require(method in {"GET", "DELETE"}, "METHOD_FORBIDDEN")
         require(re.fullmatch(r"/v1/[a-z0-9/-]+", path) is not None, "PATH_FORBIDDEN")
         if method == "DELETE":
             require(re.fullmatch(r"/v1/(servers|backup-storages)/[1-9][0-9]*|/v1/ips/[a-f0-9-]{36}", path) is not None, "DELETE_PATH_FORBIDDEN")
-            require(fields is None and offset is None, "DELETE_QUERY_FORBIDDEN")
+            require(fields is None and offset is None and status_filter is None, "DELETE_QUERY_FORBIDDEN")
         params = {}
         if fields is not None:
             params["fields"] = fields
         if offset is not None:
             params.update(limit=100, offset=offset)
+        if status_filter is not None:
+            require(status_filter in {"assigned", "available"} and method == "GET"
+                    and re.fullmatch(r"/v1/(?:projects/[1-9][0-9]*/ips|servers/[1-9][0-9]*/(?:ips|subnets))", path),
+                    "STATUS_FILTER_FORBIDDEN")
+            params["status"] = status_filter
         url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
         delay = 0.3 - (time.monotonic() - self._last_request)
         if delay > 0:
             time.sleep(delay)
         require(datetime.now(timezone.utc) < self._deadline, "REQUEST_WINDOW_EXPIRED")
+        require(time.monotonic() < self._hard_end, "API_EXECUTION_BUDGET_EXPIRED")
         self._last_request = time.monotonic()
         request = urllib.request.Request(url, method=method, headers={
             "Authorization": "Bearer " + self._token,
@@ -140,15 +156,20 @@ class Api:
         })
         started = time.monotonic()
         try:
-            with self._opener.open(request, timeout=15) as response:
+            timeout = min(15, self._hard_end-time.monotonic(),
+                          (self._deadline-datetime.now(timezone.utc)).total_seconds())
+            require(timeout > 0, "REQUEST_WINDOW_EXPIRED")
+            with self._opener.open(request, timeout=timeout) as response:
                 status = int(response.status)
                 chunks, length = [], 0
                 while True:
                     require(datetime.now(timezone.utc) < self._deadline, "REQUEST_WINDOW_EXPIRED")
                     require(time.monotonic() - started < 15, "HTTP_WALL_TIMEOUT")
+                    require(time.monotonic() < self._hard_end, "API_EXECUTION_BUDGET_EXPIRED")
                     chunk = response.read1(65536)
                     require(datetime.now(timezone.utc) < self._deadline, "REQUEST_WINDOW_EXPIRED")
                     require(time.monotonic() - started < 15, "HTTP_WALL_TIMEOUT")
+                    require(time.monotonic() < self._hard_end, "API_EXECUTION_BUDGET_EXPIRED")
                     if not chunk:
                         break
                     length += len(chunk)
@@ -179,10 +200,11 @@ def get(api, path: str, fields: str):
     return result
 
 
-def listing(api, path: str, fields: str = "id,href") -> list:
+def listing(api, path: str, fields: str = "id,href", status_filter: str | None = None) -> list:
     all_items = []
     for offset in range(0, 501, 100):
-        status, items = api.request("GET", path, fields, offset)
+        status, items = (api.request("GET", path, fields, offset, status_filter=status_filter)
+                         if status_filter is not None else api.request("GET", path, fields, offset))
         require(status == 200, f"HTTP_{status}")
         require(isinstance(items, list) and len(items) <= 100, "INVALID_LIST_SCHEMA")
         require(all(isinstance(item, dict) for item in items), "INVALID_LIST_ITEM")
@@ -217,18 +239,18 @@ def validate(control: dict, ledger_raw: str, now: datetime) -> dict:
     require(ledger["schema_version"] == 1 and ledger["lab_id"] == control["lab_id"], "LEDGER_SCOPE")
     resources = ledger["resources"]
     require(isinstance(resources, list) and len(resources) <= 12, "LEDGER_RESOURCE_LIMIT")
-    keys, roles, server_ids = set(), set(), set()
+    keys, roles, server_ids, child_slots = set(), set(), set(), set()
     for resource in resources:
         require(isinstance(resource, dict), "LEDGER_RESOURCE_SCHEMA")
         kind = resource.get("kind")
         require(kind in ENDPOINTS, "UNSUPPORTED_RESOURCE_KIND")
         identity = resource.get("id")
-        if kind == "ip":
+        if kind in {"ip", *MANAGED}:
             require(isinstance(identity, str) and re.fullmatch(r"[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}", identity) is not None, "INVALID_IP_ID")
         else:
             number(identity)
-        require((kind, identity) not in keys, "DUPLICATE_LEDGER_RESOURCE")
-        keys.add((kind, identity))
+        require((ENDPOINTS[kind], identity) not in keys, "DUPLICATE_LEDGER_RESOURCE")
+        keys.add((ENDPOINTS[kind], identity))
         require(resource.get("ownership_verified") is True, "UNVERIFIED_ENROLLMENT")
         if kind == "server":
             role = resource.get("role")
@@ -237,9 +259,26 @@ def validate(control: dict, ledger_raw: str, now: datetime) -> dict:
             require(re.fullmatch(r"nexsight-[a-z0-9-]{3,100}", resource.get("hostname", "")) is not None, "HOSTNAME_INVALID")
             roles.add(role)
             server_ids.add(identity)
+        if kind in MANAGED:
+            allowed = {"kind", "id", "server_id", "ownership_verified",
+                       "ip_type" if kind == "managed_ip" else "cidr"}
+            require(set(resource) == allowed, "MANAGED_CHILD_LEDGER_SCHEMA")
+            if kind == "managed_ip":
+                require(resource["ip_type"] in {"primary-ip", "private-ip"}, "MANAGED_IP_TYPE_FORBIDDEN")
+                slot = resource["ip_type"]
+            else:
+                network = ipv6_64(resource["cidr"])
+                slot = "ipv6_subnet"
+                require(str(network) == resource["cidr"], "EXACT_MANAGED_IPV6_CIDR_REQUIRED")
+            require((resource["server_id"], slot) not in child_slots, "MANAGED_CHILD_CARDINALITY")
+            child_slots.add((resource["server_id"], slot))
     for resource in resources:
         if resource["kind"] != "server":
             require(resource.get("server_id") in server_ids, "PARENT_SERVER_NOT_ENROLLED")
+        if resource["kind"] == "managed_ipv6_subnet":
+            parent = next(r for r in resources if r["kind"] == "server" and r["id"] == resource["server_id"])
+            require(parent["role"] in PLANS and parent["plan_id"] == PLANS[parent["role"]],
+                    "MANAGED_IPV6_PARENT_FORBIDDEN")
     t0 = control.get("first_paid_at_utc")
     if resources:
         require(t0 is not None, "PAID_CLOCK_REQUIRED")
@@ -267,7 +306,27 @@ def auth_scope(api, control: dict):
 
 
 def inventory(api, control: dict) -> dict:
-    return {kind: listing(api, f"/v1/projects/{control['project_id']}/{kind}") for kind in INVENTORIES}
+    observed = {}
+    for kind in INVENTORIES:
+        path = f"/v1/projects/{control['project_id']}/{kind}"
+        if kind == "ips":
+            items = [item for state in ("assigned", "available")
+                     for item in listing(api, path, status_filter=state)]
+            require(len({item.get("id") for item in items}) == len(items), "STATUS_INVENTORY_INCONSISTENT")
+            observed[kind] = items
+        else:
+            observed[kind] = listing(api, path)
+    return observed
+
+
+def ipv6_64(value):
+    try:
+        require(isinstance(value, str), "MANAGED_IPV6_64_REQUIRED")
+        network = ipaddress.IPv6Network(value, strict=True)
+    except (ValueError, TypeError):
+        raise GuardError("MANAGED_IPV6_64_REQUIRED") from None
+    require(network.prefixlen == 64 and network.is_global, "MANAGED_IPV6_64_REQUIRED")
+    return network
 
 
 def verify_resource(obj: dict, resource: dict, control: dict):
@@ -285,28 +344,74 @@ def verify_resource(obj: dict, resource: dict, control: dict):
         require(obj.get("project", {}).get("id") == control["project_id"], "IP_PROJECT_MISMATCH")
         require(obj.get("region", {}).get("id") == REGION, "IP_REGION_MISMATCH")
         require(obj.get("tags", {}).get("nexsight_lab") == control["lab_id"], "IP_LAB_TAG_MISMATCH")
+        require(obj.get("type") == "floating-ip", "TAGGED_IP_TYPE_FORBIDDEN")
+    if kind in MANAGED:
+        require(obj.get("project", {}).get("id") == control["project_id"], "MANAGED_CHILD_PROJECT_MISMATCH")
+        require(obj.get("region", {}).get("id") == REGION, "MANAGED_CHILD_REGION_MISMATCH")
+        parent = obj.get("assigned_to")
+        require(isinstance(parent, dict) and parent.get("id") == resource["server_id"], "MANAGED_CHILD_PARENT_MISMATCH")
+        if "href" in parent:
+            href(parent["href"], f"/v1/servers/{resource['server_id']}")
+        if kind == "managed_ip":
+            require(type(obj.get("address_family")) is int and obj["address_family"] == 4
+                    and obj.get("type") == resource["ip_type"], "MANAGED_IPV4_TYPE_MISMATCH")
+        else:
+            require(type(obj.get("address_family")) is int and obj["address_family"] == 6
+                    and obj.get("cidr") == resource["cidr"], "MANAGED_IPV6_CIDR_MISMATCH")
+            ipv6_64(obj["cidr"])
+
+
+def inventory_guard(observed, ledger):
+    for unsupported in ("storages", "load-balancers"):
+        require(not observed[unsupported], "UNSUPPORTED_BILLABLE_RESOURCE_PRESENT")
+    enrolled = {endpoint: {r["id"] for r in ledger["resources"] if ENDPOINTS[r["kind"]] == endpoint}
+                for endpoint in set(ENDPOINTS.values())}
+    for endpoint, identities in enrolled.items():
+        require({item.get("id") for item in observed[endpoint]} <= identities,
+                "UNSUPPORTED_BILLABLE_RESOURCE_PRESENT" if endpoint == "subnets" else "UNENROLLED_RESOURCE_PRESENT")
+    return enrolled
+
+
+def verify_parent_membership(api, parent_id, resources):
+    # Both sides of the provider relation, not a client-supplied server_id alone.
+    for kind, endpoint in (("managed_ip", "ips"), ("managed_ipv6_subnet", "subnets")):
+        expected = {r["id"] for r in resources if r["kind"] == kind and r["server_id"] == parent_id}
+        if not expected:
+            continue
+        rows = listing(api, f"/v1/servers/{parent_id}/{endpoint}", status_filter="assigned")
+        known = {r["id"] for r in resources if r.get("server_id") == parent_id
+                 and ENDPOINTS[r["kind"]] in {"ips", "subnets"}}
+        ids = {row.get("id") for row in rows}
+        require(expected <= ids and ids <= known, "PROVIDER_PARENT_MEMBERSHIP_MISMATCH")
 
 
 def inspect(api, control: dict, ledger: dict) -> tuple[dict, dict]:
     auth_scope(api, control)
     observed = inventory(api, control)
-    for unsupported in ("storages", "subnets", "load-balancers"):
-        require(not observed[unsupported], "UNSUPPORTED_BILLABLE_RESOURCE_PRESENT")
-    enrolled = {kind: {r["id"] for r in ledger["resources"] if ENDPOINTS[r["kind"]] == kind} for kind in ENDPOINTS.values()}
-    for kind, identities in enrolled.items():
-        require({item.get("id") for item in observed[kind]} <= identities, "UNENROLLED_RESOURCE_PRESENT")
+    enrolled = inventory_guard(observed, ledger)
     objects = {}
-    for resource in ledger["resources"]:
+    absent_parents = set()
+    for resource in sorted(ledger["resources"], key=lambda item: item["kind"] != "server"):
         kind, identity = resource["kind"], resource["id"]
         path = f"/v1/{ENDPOINTS[kind]}/{identity}"
         status, obj = api.request("GET", path, SAFE_FIELDS[kind])
         if status == 404:
             require(identity not in {item.get("id") for item in observed[ENDPOINTS[kind]]}, "ABSENCE_INCONSISTENT")
+            if kind == "server":
+                absent_parents.add(identity)
             continue
+        if status == 403 and kind in MANAGED:
+            require(resource["server_id"] in absent_parents
+                    and identity not in {item.get("id") for item in observed[ENDPOINTS[kind]]},
+                    "MANAGED_CHILD_RELEASE_NOT_PROVEN")
+            continue  # Project release only, NEVER a global-record deletion claim.
         require(status == 200, f"HTTP_{status}")
         require(identity in {item.get("id") for item in observed[ENDPOINTS[kind]]}, "RESOURCE_INVENTORY_INCONSISTENT")
         verify_resource(obj, resource, control)
         objects[(kind, identity)] = obj
+    for (kind, identity) in objects:
+        if kind == "server":
+            verify_parent_membership(api, identity, ledger["resources"])
     for resource in ledger["resources"]:
         if resource["kind"] == "backup_storage" and ("backup_storage", resource["id"]) in objects:
             parent = objects.get(("server", resource["server_id"]))
@@ -320,6 +425,35 @@ def inspect(api, control: dict, ledger: dict) -> tuple[dict, dict]:
             backup_id = obj["backup_storage"].get("id")
             require(backup_id in enrolled["backup-storages"], "UNENROLLED_BACKUP_STORAGE")
     return observed, objects
+
+
+def await_managed_release(api, control, ledger):
+    managed = [r for r in ledger["resources"] if r["kind"] in MANAGED]
+    end = time.monotonic() + 15 * 60
+    while True:
+        observed = inventory(api, control)
+        inventory_guard(observed, ledger)
+        released, parents_absent = 0, {}
+        for resource in managed:
+            parent_id = resource["server_id"]
+            if parent_id not in parents_absent:
+                parent_status, _ = api.request("GET", f"/v1/servers/{parent_id}", SAFE_FIELDS["server"])
+                require(parent_status in {200, 404}, f"PARENT_ABSENCE_HTTP_{parent_status}")
+                parents_absent[parent_id] = parent_status == 404
+            endpoint = ENDPOINTS[resource["kind"]]
+            if resource["id"] in {item.get("id") for item in observed[endpoint]}:
+                continue
+            status, obj = api.request("GET", f"/v1/{endpoint}/{resource['id']}", SAFE_FIELDS[resource["kind"]])
+            require(status in {200, 403, 404}, f"MANAGED_RELEASE_HTTP_{status}")
+            if status == 200:
+                verify_resource(obj, resource, control)
+                continue
+            if parents_absent[parent_id]:
+                released += 1  # 403 = project release, not global deletion.
+        if released == len(managed) and not any(observed.values()):
+            return observed, released
+        require(time.monotonic() < end, "MANAGED_CHILD_RELEASE_NOT_CONFIRMED")
+        time.sleep(5)  # Reads only; API independently enforces the 20-minute/window bounds.
 
 
 def run(api, control: dict, ledger: dict, execute: bool = False) -> dict:
@@ -355,12 +489,22 @@ def run(api, control: dict, ledger: dict, execute: bool = False) -> dict:
                 # Never repeat a possibly successful mutation. Continue only
                 # with separately enrolled and independently verified IDs.
                 failures.append(str(error))
-    final = inventory(api, control)
+    released = 0
+    if any(r["kind"] in MANAGED for r in ledger["resources"]):
+        try:
+            final, released = await_managed_release(api, control, ledger)
+        except GuardError as error:
+            failures.append(str(error))
+            final = inventory(api, control)
+    else:
+        final = inventory(api, control)
     if failures or any(final.values()):
         return {"result": "FAIL", "mode": "EXACT_CLEANUP", "reason": "CLEANUP_INCOMPLETE",
                 "delete_requests": deleted, "failure_codes": failures,
                 "remaining_resources": sum(len(items) for items in final.values())}
-    return {"result": "PASS", "mode": "EXACT_CLEANUP", "delete_requests": deleted, "final_inventory_empty": True}
+    return {"result": "PASS", "mode": "EXACT_CLEANUP", "delete_requests": deleted, "final_inventory_empty": True,
+            "provider_managed_children_released_from_project": released,
+            "global_provider_record_deletion_claimed": False}
 
 
 def main(argv=None) -> int:
