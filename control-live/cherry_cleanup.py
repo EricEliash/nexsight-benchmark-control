@@ -92,7 +92,9 @@ def reject_sensitive(value):
 
 
 def href(value, path: str) -> None:
-    require(value == API + path, "RESOURCE_HREF_MISMATCH")
+    # Live v1 responses use exact relative self-links without the API version.
+    # Never follow these links or normalize foreign hosts, queries or traversal.
+    require(value in (API + path, path.removeprefix("/v1")), "RESOURCE_HREF_MISMATCH")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
